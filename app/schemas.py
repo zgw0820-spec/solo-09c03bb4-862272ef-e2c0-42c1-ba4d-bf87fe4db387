@@ -78,6 +78,7 @@ class PVCSummary(BaseModel):
     volume_name: str | None = None
     storage_class: str = ""
     requested_storage: str | None = None
+    actual_capacity: str | None = None
     access_modes: list[str] = Field(default_factory=list)
     volume_mode: str = "Filesystem"
 
@@ -86,6 +87,87 @@ class CheckResult(BaseModel):
     name: str
     passed: bool
     detail: str = ""
+
+
+class ExpansionRequest(BaseModel):
+    """Ask to grow one Bound PVC to ``target_capacity``."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "request_id": "exp-20261120-prom-001",
+                    "namespace": "monitoring",
+                    "name": "prometheus-data-0",
+                    "uid": "0f7a9a53-9d1f-4a1a-9f43-3a7c1f0d2b11",
+                    "target_capacity": "250Gi",
+                }
+            ]
+        },
+    )
+
+    request_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+        description="Idempotency key. Re-submitting the same id with the same "
+        "parameters reports progress or resumes the original request; "
+        "changing any parameter is a conflict.",
+        examples=["exp-20261120-prom-001"],
+    )
+    namespace: str = Field(..., pattern=DNS_LABEL, max_length=63, examples=["monitoring"])
+    name: str = Field(..., pattern=DNS_LABEL, max_length=253, examples=["prometheus-data-0"])
+    uid: str = Field(..., min_length=1, max_length=128)
+    target_capacity: str = Field(
+        ...,
+        min_length=1,
+        max_length=32,
+        examples=["250Gi"],
+        description="Target request in Kubernetes quantity notation.",
+    )
+
+
+class ExpansionQuota(BaseModel):
+    """Who, if anyone, currently holds the storage-class gate."""
+
+    storage_class: str
+    occupied: bool
+    holder_request_id: str | None = None
+    holder_phase: str | None = None
+    holder_pvc: str | None = None
+    since: str | None = None
+
+
+class ExpansionResponse(BaseModel):
+    request_id: str
+    status: Literal[
+        "writing", "unconfirmed", "expanding", "completed", "not_applied"
+    ] = Field(
+        ...,
+        description="completed = actual capacity reached the target and the gate "
+        "is released; unconfirmed = outcome unknown, gate stays held; "
+        "expanding = request accepted, waiting for status.capacity; "
+        "not_applied = verified that the write did not take effect, gate released.",
+    )
+    status_text: str
+    namespace: str
+    name: str
+    uid: str
+    storage_class: str
+    target_capacity: str
+    requested_storage: str | None = None
+    actual_capacity: str | None = None
+    pvc: PVCSummary | None = None
+    quota: ExpansionQuota
+    verify_after: str | None = Field(
+        default=None,
+        description="For unconfirmed requests: re-submit the same request id "
+        "after this time to re-check.",
+    )
+    last_error: str | None = None
+    message: str = ""
 
 
 class HandoverResponse(BaseModel):

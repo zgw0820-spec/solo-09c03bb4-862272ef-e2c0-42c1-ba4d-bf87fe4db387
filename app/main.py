@@ -13,10 +13,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.errors import ApiError
+from app.expansion import ExpansionService
 from app.kube import KubernetesClient, KubeClient, KubeError, Unavailable
 from app.schemas import (
     ClaimRef,
     ErrorResponse,
+    ExpansionQuota,
+    ExpansionRequest,
+    ExpansionResponse,
     HandoverRequest,
     HandoverResponse,
     HealthResponse,
@@ -60,6 +64,7 @@ def create_app(kube: KubeClient | None = None) -> FastAPI:
         if kube is None:
             app.state.kube = _build_kube()
             app.state.service = HandoverService(app.state.kube)
+        app.state.expansion = ExpansionService(app.state.kube)
         yield
         close = getattr(app.state.kube, "close", None)
         if callable(close):
@@ -68,22 +73,26 @@ def create_app(kube: KubeClient | None = None) -> FastAPI:
                 await result
 
     app = FastAPI(
-        title="监控数据卷交接 API",
-        version="1.0.0",
+        title="监控数据卷交接与扩容 API",
+        version="1.1.0",
         description=(
             "在 Kubernetes 上重建监控库时，把旧的、已 Released 且回收策略为 "
-            "Retain 的持久卷交给已预先绑定的新 PVC。\n\n"
-            "**幂等性**：同一新 PVC（命名空间/名称/UID）重复提交只返回集群进度，"
+            "Retain 的持久卷交给已预先绑定的新 PVC；并按存储类**逐块**扩容监控 PVC。\n\n"
+            "**交接幂等性**：同一新 PVC（命名空间/名称/UID）重复提交只返回集群进度，"
             "不会重复写入。\n\n"
-            "**并发**：不同接手方并发提交时，只有一方能拿到预留，另一方收到 409。\n\n"
-            "**状态**：预留已生效但未绑定完成 → `pending_binding`（HTTP 202）；"
-            "PV 与 PVC 都已 Bound 且相互指向 → `completed`（HTTP 200）。"
+            "**交接并发**：不同接手方并发提交时，只有一方能拿到预留，另一方收到 409。\n\n"
+            "**扩容名额**：每个存储类同时最多一笔经 `/expansions` 发起的扩容在途。"
+            "名额记录在集群内的协调 ConfigMap 中，两个服务实例共享；只有核实实际容量"
+            "已达目标，或核实写入未生效，才释放名额。写入结果未明时保持 `unconfirmed`"
+            "（待核实）并继续占用。\n\n"
+            "**扩容幂等性**：同一 `request_id` 重提可查进度或接续原申请；改参数报 409。"
         ),
         lifespan=lifespan,
     )
     if kube is not None:
         app.state.kube = kube
         app.state.service = HandoverService(kube)
+        app.state.expansion = ExpansionService(kube)
 
     _install_handlers(app)
     _install_routes(app)
@@ -185,6 +194,54 @@ def _install_routes(app: FastAPI) -> None:
             new_pvc=ClaimRef(namespace=namespace, name=name, uid=uid),
         )
         return await anyio.to_thread.run_sync(service.status, body)
+
+    # ------------------------------------------------------------- expansion
+    @app.post(
+        "/expansions",
+        response_model=ExpansionResponse,
+        status_code=202,
+        responses={
+            200: {"model": ExpansionResponse, "description": "扩容已完成或已核实未生效"},
+            202: {"model": ExpansionResponse, "description": "名额已占用，写入或核实进行中"},
+            404: {"model": ErrorResponse, "description": "PVC 或请求号不存在"},
+            409: {"model": ErrorResponse, "description": "名额被占用 / 请求号参数冲突 / 准入不通过"},
+            422: {"model": ErrorResponse, "description": "请求参数不合法"},
+            502: {"model": ErrorResponse, "description": "集群写入被拒绝或未反映"},
+            503: {"model": ErrorResponse, "description": "写入结果未明 / Kubernetes API 不可用"},
+        },
+        summary="申请扩容一个 PVC（同名请求号幂等，可接续原申请）",
+        tags=["扩容"],
+    )
+    async def submit_expansion(body: ExpansionRequest, request: Request) -> JSONResponse:
+        service: ExpansionService = request.app.state.expansion
+        response = await anyio.to_thread.run_sync(service.submit, body)
+        # 202 while the gate is still held; 200 once nothing is in flight.
+        status_code = 202 if response.status in ("writing", "unconfirmed", "expanding") else 200
+        return JSONResponse(status_code=status_code, content=response.model_dump())
+
+    @app.get(
+        "/expansions/{request_id}",
+        response_model=ExpansionResponse,
+        responses={404: {"model": ErrorResponse}},
+        summary="按请求号只读查询扩容进度（不推进核实、不改变名额）",
+        tags=["扩容"],
+    )
+    async def expansion_status(request_id: str, request: Request) -> ExpansionResponse:
+        service: ExpansionService = request.app.state.expansion
+        return await anyio.to_thread.run_sync(service.status, request_id)
+
+    @app.get(
+        "/expansions",
+        response_model=ExpansionQuota,
+        summary="查询某个存储类的扩容名额占用情况",
+        tags=["扩容"],
+    )
+    async def expansion_quota(
+        request: Request,
+        storage_class: str = Query(..., description="存储类名称"),
+    ) -> ExpansionQuota:
+        service: ExpansionService = request.app.state.expansion
+        return await anyio.to_thread.run_sync(service.quota, storage_class)
 
 
 def _probe(service: HandoverService) -> None:

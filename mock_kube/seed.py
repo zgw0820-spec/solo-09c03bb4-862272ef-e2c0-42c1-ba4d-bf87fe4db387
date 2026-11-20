@@ -36,6 +36,17 @@ NEW_CLAIM = "prometheus-data-rebuilt"
 RIVAL_CLAIM = "prometheus-data-rival"
 WRONG_MODE_CLAIM = "prometheus-data-block"
 
+# --- expansion scenario ------------------------------------------------------
+EXPAND_NAMESPACE = "monitoring"
+EXPAND_CLASS = "fast-ssd"
+EXPAND_CLASS_FROZEN = "slow-hdd"
+PVC_A = "prometheus-data-0"
+PVC_A_UID = "4a1c9e70-aaaa-4bbb-8ccc-00000000000a"
+PVC_B = "prometheus-data-1"
+PVC_B_UID = "5b2da081-bbbb-4ccc-8ddd-00000000000b"
+PVC_FROZEN = "thanos-compact-0"
+PVC_FROZEN_UID = "6c3eb192-cccc-4ddd-9eee-00000000000c"
+
 
 def _pv(
     name: str,
@@ -96,6 +107,41 @@ def _pvc(
     }
 
 
+def _bound_pvc(
+    name: str,
+    uid: str,
+    *,
+    capacity: str,
+    storage_class: str = EXPAND_CLASS,
+    access_modes: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": name, "namespace": EXPAND_NAMESPACE, "uid": uid},
+        "spec": {
+            "accessModes": access_modes or ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": capacity}},
+            "storageClassName": storage_class,
+            "volumeMode": "Filesystem",
+            "volumeName": f"pv-{name}",
+        },
+        "status": {"phase": "Bound", "capacity": {"storage": capacity}},
+    }
+
+
+def _storage_class(name: str, allow_expansion: bool) -> dict[str, Any]:
+    return {
+        "apiVersion": "storage.k8s.io/v1",
+        "kind": "StorageClass",
+        "metadata": {"name": name},
+        "provisioner": "mock.io/local",
+        "allowVolumeExpansion": allow_expansion,
+        "volumeBindingMode": "WaitForFirstConsumer",
+        "reclaimPolicy": "Retain",
+    }
+
+
 DEMO_BODIES = {
     "handover": {
         "pv_name": PROM_PV,
@@ -116,6 +162,36 @@ DEMO_BODIES = {
         "pv_name": VOLUME_MODE_PV,
         "old_pvc_uid": WRONG_MODE_OLD_UID,
         "new_pvc": {"namespace": NAMESPACE, "name": WRONG_MODE_CLAIM, "uid": RIVAL_UID},
+    },
+    # --- expansion demo: both claims live on the same expandable class ------
+    "expand_a": {
+        "request_id": "exp-20261120-prom-001",
+        "namespace": EXPAND_NAMESPACE,
+        "name": PVC_A,
+        "uid": PVC_A_UID,
+        "target_capacity": "250Gi",
+    },
+    "expand_b": {
+        "request_id": "exp-20261120-prom-002",
+        "namespace": EXPAND_NAMESPACE,
+        "name": PVC_B,
+        "uid": PVC_B_UID,
+        "target_capacity": "250Gi",
+    },
+    "expand_frozen": {
+        "request_id": "exp-20261120-thanos-001",
+        "namespace": EXPAND_NAMESPACE,
+        "name": PVC_FROZEN,
+        "uid": PVC_FROZEN_UID,
+        "target_capacity": "100Gi",
+    },
+    # Same request id as expand_a, but a different target: must be rejected.
+    "expand_a_changed": {
+        "request_id": "exp-20261120-prom-001",
+        "namespace": EXPAND_NAMESPACE,
+        "name": PVC_A,
+        "uid": PVC_A_UID,
+        "target_capacity": "300Gi",
     },
 }
 
@@ -157,5 +233,25 @@ def seed(store: InMemoryKube) -> None:
             RIVAL_UID,
             volume_name=VOLUME_MODE_PV,
             volume_mode="Filesystem",
+        ),
+    )
+
+    # Expansion demo: one expandable class with two live claims plus a class
+    # that has expansion disabled.
+    store.create_storage_class(_storage_class(EXPAND_CLASS, True))
+    store.create_storage_class(_storage_class(EXPAND_CLASS_FROZEN, False))
+    store.create_pvc(
+        EXPAND_NAMESPACE, _bound_pvc(PVC_A, PVC_A_UID, capacity="100Gi")
+    )
+    store.create_pvc(
+        EXPAND_NAMESPACE, _bound_pvc(PVC_B, PVC_B_UID, capacity="100Gi")
+    )
+    store.create_pvc(
+        EXPAND_NAMESPACE,
+        _bound_pvc(
+            PVC_FROZEN,
+            PVC_FROZEN_UID,
+            capacity="50Gi",
+            storage_class=EXPAND_CLASS_FROZEN,
         ),
     )

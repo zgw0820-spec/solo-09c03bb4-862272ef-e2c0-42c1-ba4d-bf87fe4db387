@@ -21,6 +21,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+import urllib3
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 from kubernetes.client.exceptions import ApiException
@@ -46,10 +47,31 @@ class Unavailable(KubeError):
     """The API server could not be reached."""
 
 
+class Ambiguous(KubeError):
+    """A write failed without a trustworthy answer.
+
+    The API server (or a proxy on the way to it) may have applied the write
+    even though the caller did not receive the receipt: timeouts, dropped
+    connections and 5xx responses all land here. Callers must re-read the
+    object before deciding whether the write happened.
+    """
+
+
 class KubeClient(Protocol):
     def get_pv(self, name: str) -> dict[str, Any]: ...
     def get_pvc(self, namespace: str, name: str) -> dict[str, Any]: ...
     def update_pv(self, name: str, body: dict[str, Any]) -> dict[str, Any]: ...
+    def update_pvc(
+        self, namespace: str, name: str, body: dict[str, Any]
+    ) -> dict[str, Any]: ...
+    def get_storage_class(self, name: str) -> dict[str, Any]: ...
+    def get_config_map(self, namespace: str, name: str) -> dict[str, Any]: ...
+    def create_config_map(
+        self, namespace: str, body: dict[str, Any]
+    ) -> dict[str, Any]: ...
+    def update_config_map(
+        self, namespace: str, name: str, body: dict[str, Any]
+    ) -> dict[str, Any]: ...
 
 
 def _translate(exc: ApiException, what: str) -> KubeError:
@@ -78,6 +100,30 @@ def _translate(exc: ApiException, what: str) -> KubeError:
     return KubeError(message)
 
 
+def _translate_write(exc: Exception, what: str) -> KubeError:
+    """Classify a failed write.
+
+    4xx answers are trustworthy: the API server rejected the write, so it did
+    not happen. Everything else (timeouts, connection resets, 5xx from the
+    server or a proxy) is ambiguous and must be verified by re-reading.
+    """
+    if isinstance(exc, ApiException):
+        status = exc.status or 0
+        if status == 0 or status >= 500:
+            return Ambiguous(f"{what}: no trustworthy response (status {status or 'n/a'})")
+        translated = _translate(exc, what)
+        if 400 <= status < 500 and not isinstance(translated, (Conflict, NotFound)):
+            # Any other definitive rejection (400/401/403/415/422...) proves
+            # the write was not applied.
+            return Invalid(str(translated))
+        return translated
+    if isinstance(exc, urllib3.exceptions.HTTPError):
+        return Ambiguous(f"{what}: {type(exc).__name__}: {exc}")
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+        return Ambiguous(f"{what}: {type(exc).__name__}: {exc}")
+    raise exc
+
+
 @dataclass
 class KubernetesClient:
     """Thin wrapper around the official client, scoped to what we need."""
@@ -85,6 +131,7 @@ class KubernetesClient:
     core: k8s_client.CoreV1Api
     request_timeout: float = 10.0
     _api_client: k8s_client.ApiClient | None = None
+    _storage: k8s_client.StorageV1Api | None = None
 
     def __post_init__(self) -> None:
         api_client = getattr(self.core, "api_client", None)
@@ -158,6 +205,78 @@ class KubernetesClient:
             )
         except ApiException as exc:
             raise _translate(exc, f"updating PersistentVolume {name!r}") from exc
+        return self._to_dict(obj)
+
+    def update_pvc(
+        self, namespace: str, name: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        """JSON-merge-patch a PVC (used only for capacity expansion)."""
+        try:
+            obj = self.core.patch_namespaced_persistent_volume_claim(
+                name,
+                namespace,
+                body,
+                _content_type="application/merge-patch+json",
+                _request_timeout=self.request_timeout,
+            )
+        except Exception as exc:  # noqa: BLE001 - classified below
+            raise _translate_write(
+                exc, f"updating PersistentVolumeClaim {namespace}/{name}"
+            ) from exc
+        return self._to_dict(obj)
+
+    def get_storage_class(self, name: str) -> dict[str, Any]:
+        try:
+            obj = self._storage_api().read_storage_class(
+                name, _request_timeout=self.request_timeout
+            )
+        except ApiException as exc:
+            raise _translate(exc, f"reading StorageClass {name!r}") from exc
+        return self._to_dict(obj)
+
+    def _storage_api(self) -> k8s_client.StorageV1Api:
+        if self._storage is None:
+            assert self._api_client is not None
+            self._storage = k8s_client.StorageV1Api(self._api_client)
+        return self._storage
+
+    def get_config_map(self, namespace: str, name: str) -> dict[str, Any]:
+        try:
+            obj = self.core.read_namespaced_config_map(
+                name, namespace, _request_timeout=self.request_timeout
+            )
+        except ApiException as exc:
+            raise _translate(exc, f"reading ConfigMap {namespace}/{name}") from exc
+        return self._to_dict(obj)
+
+    def create_config_map(
+        self, namespace: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            obj = self.core.create_namespaced_config_map(
+                namespace, body, _request_timeout=self.request_timeout
+            )
+        except Exception as exc:  # noqa: BLE001 - classified below
+            raise _translate_write(
+                exc, f"creating ConfigMap {namespace}/{body.get('metadata', {}).get('name')}"
+            ) from exc
+        return self._to_dict(obj)
+
+    def update_config_map(
+        self, namespace: str, name: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            obj = self.core.patch_namespaced_config_map(
+                name,
+                namespace,
+                body,
+                _content_type="application/merge-patch+json",
+                _request_timeout=self.request_timeout,
+            )
+        except Exception as exc:  # noqa: BLE001 - classified below
+            raise _translate_write(
+                exc, f"updating ConfigMap {namespace}/{name}"
+            ) from exc
         return self._to_dict(obj)
 
     def _to_dict(self, obj: Any) -> dict[str, Any]:

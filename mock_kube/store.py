@@ -97,6 +97,8 @@ class InMemoryKube(KubeClient):
         self._clock = clock or _utcnow
         self._pvs: dict[str, dict[str, Any]] = {}
         self._pvcs: dict[tuple[str, str], dict[str, Any]] = {}
+        self._storage_classes: dict[str, dict[str, Any]] = {}
+        self._config_maps: dict[tuple[str, str], dict[str, Any]] = {}
         self.patch_log: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------ reads
@@ -128,9 +130,112 @@ class InMemoryKube(KubeClient):
                 if namespace is None or ns == namespace
             ]
 
+    def get_storage_class(self, name: str) -> dict[str, Any]:
+        with self._lock:
+            if name not in self._storage_classes:
+                raise NotFound(f'storageclasses.storage.k8s.io "{name}" not found')
+            return copy.deepcopy(self._storage_classes[name])
+
+    def list_storage_classes(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [copy.deepcopy(sc) for sc in self._storage_classes.values()]
+
+    def create_storage_class(self, body: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            obj = copy.deepcopy(body)
+            meta = obj.setdefault("metadata", {})
+            name = meta.get("name")
+            if not name:
+                raise Invalid("metadata.name is required")
+            if name in self._storage_classes:
+                raise Conflict(
+                    f'storageclasses.storage.k8s.io "{name}" already exists'
+                )
+            meta.setdefault("uid", new_uid())
+            meta["resourceVersion"] = "1"
+            obj.setdefault("apiVersion", "storage.k8s.io/v1")
+            obj.setdefault("kind", "StorageClass")
+            obj.setdefault("provisioner", "mock.io/local")
+            obj.setdefault("allowVolumeExpansion", False)
+            self._storage_classes[name] = obj
+            return copy.deepcopy(obj)
+
+    def get_config_map(self, namespace: str, name: str) -> dict[str, Any]:
+        with self._lock:
+            key = (namespace, name)
+            if key not in self._config_maps:
+                raise NotFound(
+                    f'configmaps "{name}" not found in namespace "{namespace}"'
+                )
+            return copy.deepcopy(self._config_maps[key])
+
+    def list_config_maps(self, namespace: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                copy.deepcopy(cm)
+                for (ns, _), cm in self._config_maps.items()
+                if namespace is None or ns == namespace
+            ]
+
+    def create_config_map(
+        self, namespace: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        with self._lock:
+            obj = copy.deepcopy(body)
+            meta = obj.setdefault("metadata", {})
+            name = meta.get("name")
+            if not name:
+                raise Invalid("metadata.name is required")
+            meta["namespace"] = namespace
+            key = (namespace, name)
+            if key in self._config_maps:
+                raise Conflict(
+                    f'configmaps "{name}" already exists in namespace "{namespace}"'
+                )
+            meta.setdefault("uid", new_uid())
+            meta["resourceVersion"] = "1"
+            meta.setdefault("creationTimestamp", _iso(self._clock()))
+            obj.setdefault("apiVersion", "v1")
+            obj.setdefault("kind", "ConfigMap")
+            obj.setdefault("data", {})
+            self._config_maps[key] = obj
+            return copy.deepcopy(obj)
+
+    def update_config_map(
+        self, namespace: str, name: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        with self._lock:
+            key = (namespace, name)
+            if key not in self._config_maps:
+                raise NotFound(
+                    f'configmaps "{name}" not found in namespace "{namespace}"'
+                )
+            current = self._config_maps[key]
+            meta = body.get("metadata") or {}
+            actual_uid = (current.get("metadata") or {}).get("uid")
+            if "uid" in meta and meta["uid"] not in (None, actual_uid):
+                raise Conflict(
+                    "Precondition failed: UID in precondition: "
+                    f"{meta['uid']!r}, UID in object meta: {actual_uid!r}"
+                )
+            actual_rv = (current.get("metadata") or {}).get("resourceVersion")
+            if "resourceVersion" in meta and meta["resourceVersion"] not in (None, "") \
+                    and str(meta["resourceVersion"]) != str(actual_rv):
+                raise Conflict(
+                    "Operation cannot be fulfilled on configmaps "
+                    f'"{name}": the object has been modified; please apply your '
+                    "changes to the latest version and try again"
+                )
+            patched = merge_patch(current, body)
+            patched.setdefault("metadata", {})["name"] = name
+            patched["metadata"]["namespace"] = namespace
+            patched["metadata"]["uid"] = actual_uid
+            patched["metadata"]["resourceVersion"] = str(int(actual_rv) + 1)
+            self._config_maps[key] = patched
+            return copy.deepcopy(patched)
+
     # ----------------------------------------------------------------- writes
     def update_pv(self, name: str, body: dict[str, Any]) -> dict[str, Any]:
-        """Apply a JSON merge patch with resourceVersion + UID preconditions."""
         if not isinstance(body, dict):
             raise Invalid("patch body must be a JSON object")
         with self._lock:
@@ -169,6 +274,122 @@ class InMemoryKube(KubeClient):
             )
             self._pvs[name] = patched
             return copy.deepcopy(patched)
+
+    def update_pvc(
+        self, namespace: str, name: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Apply a JSON merge patch to a PVC, enforcing the expansion rules.
+
+        Mirrors a real API server closely enough for the service to be tested
+        end to end: UID and resourceVersion preconditions, requests-only
+        resource changes, and no shrinking below the current request.
+        """
+        if not isinstance(body, dict):
+            raise Invalid("patch body must be a JSON object")
+        with self._lock:
+            key = (namespace, name)
+            if key not in self._pvcs:
+                raise NotFound(
+                    f'persistentvolumeclaims "{name}" not found in namespace "{namespace}"'
+                )
+            current = self._pvcs[key]
+            meta = body.get("metadata") or {}
+            actual_uid = (current.get("metadata") or {}).get("uid")
+            if "uid" in meta and meta["uid"] not in (None, actual_uid):
+                raise Conflict(
+                    "Precondition failed: UID in precondition: "
+                    f"{meta['uid']!r}, UID in object meta: {actual_uid!r}"
+                )
+            actual_rv = (current.get("metadata") or {}).get("resourceVersion")
+            if (
+                "resourceVersion" in meta
+                and meta["resourceVersion"] not in (None, "")
+                and str(meta["resourceVersion"]) != str(actual_rv)
+            ):
+                raise Conflict(
+                    "Operation cannot be fulfilled on persistentvolumeclaims "
+                    f'"{name}": the object has been modified; please apply your '
+                    "changes to the latest version and try again"
+                )
+
+            spec_patch = body.get("spec") or {}
+            for field in spec_patch:
+                if field != "resources":
+                    raise Invalid(
+                        f'PersistentVolumeClaim "{name}" is invalid: spec.{field}: '
+                        "Forbidden: spec is immutable after creation except "
+                        "resources.requests for bound claims"
+                    )
+            resources_patch = spec_patch.get("resources") or {}
+            for section in resources_patch:
+                if section != "requests":
+                    raise Invalid(
+                        f'PersistentVolumeClaim "{name}" is invalid: '
+                        f"spec.resources.{section}: Forbidden: only requests may change"
+                    )
+            new_requested = (resources_patch.get("requests") or {}).get("storage")
+            if new_requested is not None:
+                from app.quantity import QuantityError, parse_quantity
+
+                old_raw = (
+                    ((current.get("spec") or {}).get("resources") or {})
+                    .get("requests", {})
+                    .get("storage")
+                )
+                try:
+                    old_value = parse_quantity(old_raw)
+                    new_value = parse_quantity(new_requested)
+                except QuantityError as exc:
+                    raise Invalid(f"invalid storage quantity: {exc}") from exc
+                if new_value < old_value:
+                    raise Invalid(
+                        f'PersistentVolumeClaim "{name}" is invalid: '
+                        "spec.resources.requests.storage: Forbidden: field can not "
+                        "be less than previous value"
+                    )
+
+            patched = merge_patch(current, body)
+            patched.setdefault("metadata", {})["name"] = name
+            patched["metadata"]["namespace"] = namespace
+            patched["metadata"]["uid"] = actual_uid
+            patched["metadata"]["resourceVersion"] = str(int(actual_rv) + 1)
+            self._pvcs[key] = patched
+            return copy.deepcopy(patched)
+
+    def reconcile_expansions(self) -> list[str]:
+        """Play the storage controller: finish expansions whose request moved.
+
+        A real CSI driver grows the volume and the PVC controller then updates
+        ``status.capacity``. The mock applies the request to status directly,
+        which is exactly the state the expansion service waits for.
+        """
+        grown: list[str] = []
+        with self._lock:
+            for (namespace, name), pvc in self._pvcs.items():
+                spec = pvc.get("spec") or {}
+                status = pvc.setdefault("status", {})
+                requested = ((spec.get("resources") or {}).get("requests") or {}).get(
+                    "storage"
+                )
+                current = (status.get("capacity") or {}).get("storage")
+                if requested is None:
+                    continue
+                from app.quantity import QuantityError, parse_quantity
+
+                try:
+                    if current is not None and parse_quantity(requested) <= parse_quantity(
+                        current
+                    ):
+                        continue
+                except QuantityError:
+                    continue
+                status["capacity"] = {**(status.get("capacity") or {}),
+                                      "storage": requested}
+                pvc["metadata"]["resourceVersion"] = str(
+                    int(pvc["metadata"]["resourceVersion"]) + 1
+                )
+                grown.append(f"{namespace}/{name}")
+        return grown
 
     def create_pv(self, body: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
@@ -339,6 +560,8 @@ class InMemoryKube(KubeClient):
             return {
                 "persistentVolumes": self.list_pvs(),
                 "persistentVolumeClaims": self.list_pvcs(),
+                "storageClasses": self.list_storage_classes(),
+                "configMaps": self.list_config_maps(),
             }
 
     def reset(self, pvs: Iterable[dict[str, Any]] | None = None,
@@ -346,6 +569,8 @@ class InMemoryKube(KubeClient):
         with self._lock:
             self._pvs.clear()
             self._pvcs.clear()
+            self._storage_classes.clear()
+            self._config_maps.clear()
             self.patch_log.clear()
             for pv in pvs or []:
                 self.create_pv(pv)

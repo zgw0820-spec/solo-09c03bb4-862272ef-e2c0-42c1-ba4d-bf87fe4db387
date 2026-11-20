@@ -46,6 +46,16 @@ def requested_storage(pvc: dict[str, Any]) -> str | None:
     return None
 
 
+def actual_capacity(pvc: dict[str, Any]) -> str | None:
+    """``status.capacity.storage`` -- the size the volume actually has.
+
+    Only non-empty for a Bound claim; a pending expansion may show the old
+    value here until the controller (or a human, in the mock) updates it.
+    """
+    value = ((pvc.get("status") or {}).get("capacity") or {}).get("storage")
+    return str(value) if value is not None else None
+
+
 def parse_storage(value: str | None) -> Decimal | None:
     if value is None:
         return None

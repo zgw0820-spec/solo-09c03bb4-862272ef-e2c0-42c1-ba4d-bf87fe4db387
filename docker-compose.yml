@@ -20,7 +20,43 @@ services:
       timeout: 3s
       retries: 10
 
-  handover:
+  # Two API replicas, same image, same mock cluster. They share no process
+  # memory: the per-storage-class expansion gate lives in the cluster's
+  # ConfigMap, so a submission through either replica sees the same quota.
+  handover-a:
+    build: .
+    image: volume-handover:local
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    environment: &api_env
+      # "remote" -> go through the official kubernetes client to mock-kube.
+      # Change the kubeconfig server (or drop the volume mount) for a real cluster.
+      KUBE_MODE: remote
+      KUBECONFIG: /etc/kube/config
+      KUBE_REQUEST_TIMEOUT: "10"
+      INSTANCE_ID: handover-a
+      EXPANSION_STATE_NAMESPACE: monitoring
+      EXPANSION_STATE_CONFIGMAP: pvc-expansion-state
+      EXPANSION_CONFIRM_DELAY_SECONDS: "8"
+    volumes:
+      - ./deploy/kubeconfig:/etc/kube/config:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      mock-kube:
+        condition: service_healthy
+    healthcheck: &api_health
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  handover-b:
     build: .
     image: volume-handover:local
     command:
@@ -31,20 +67,13 @@ services:
       - --port
       - "8000"
     environment:
-      # "remote" -> go through the official kubernetes client to mock-kube.
-      # Change the kubeconfig server (or drop the volume mount) for a real cluster.
-      KUBE_MODE: remote
-      KUBECONFIG: /etc/kube/config
-      KUBE_REQUEST_TIMEOUT: "10"
+      <<: *api_env
+      INSTANCE_ID: handover-b
     volumes:
       - ./deploy/kubeconfig:/etc/kube/config:ro
     ports:
-      - "8000:8000"
+      - "8002:8000"
     depends_on:
       mock-kube:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
+    healthcheck: *api_health
